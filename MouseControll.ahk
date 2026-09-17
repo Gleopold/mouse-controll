@@ -6,12 +6,14 @@
 ; ============================================================
 ;  Mouse Controll
 ;
-;  One slider sets the Windows pointer speed for the physical
-;  mouse, system wide.  The setting is saved to
-;  %APPDATA%\mouse-controll\config.ini and reapplied at launch,
-;  so putting this in Startup restores it at every login.
+;  Windows only offers 20 pointer speed steps, and near the low
+;  end each one is a 50% jump (1/8, 1/4, 3/8 of default).  This
+;  pins Windows at its neutral step and scales the movement
+;  itself in a low level mouse hook, so the slider moves in
+;  hundredths instead.
 ;
-;  The keyboard pointer layer rides on the same slider:
+;  Settings live in %APPDATA%\mouse-controll\config.ini and are
+;  reapplied at launch.
 ;
 ;  Ctrl+Shift + arrows      move the pointer
 ;  Ctrl+Shift + X + arrows  scroll the wheel
@@ -19,6 +21,7 @@
 ;  tap RCtrl                left click   (hold = drag)
 ;  RShift                   right click
 ;  Ctrl+Shift+F12           open settings
+;  Ctrl+Shift+F11           panic switch, drop the scaler
 ; ============================================================
 
 InstallKeybdHook(true)
@@ -27,32 +30,44 @@ SetMouseDelay(-1)
 CoordMode("Mouse", "Screen")
 DllCall("winmm\timeBeginPeriod", "UInt", 1)
 
-; ---------- SystemParametersInfo ----------
-SPI_GETMOUSE      := 0x0003
-SPI_SETMOUSE      := 0x0004
-SPI_GETMOUSESPEED := 0x0070
-SPI_SETMOUSESPEED := 0x0071
-SPIF_UPDATEINIFILE := 0x01
-SPIF_SENDCHANGE    := 0x02
-
 ; ---------- config location ----------
 CfgDir  := A_AppData "\mouse-controll"
 CfgFile := CfgDir "\config.ini"
 
-; ---------- the one tunable ----------
-; Windows pointer speed, 1 (slowest, most precise) to 20 (fastest).
-; 10 is the Windows default and the only value that applies no scaling
-; to what the mouse actually reports.
-Speed := 10
+; Profiles live in the same file, one section each.  This has to be set
+; here, not down beside the profile code: the auto-execute section stops
+; at the first hotkey, and BuildGui() runs long before that point.
+PROFILE_PREFIX := "Profile "
 
-; Enhance pointer precision: the OS acceleration curve.  Off means the
-; pointer moves the same distance for the same hand movement every time.
+; ---------- the one tunable ----------
+; Sensitivity as a multiple of the Windows neutral speed (step 10).
+; Continuous in steps of 0.01, from 0.05 to 3.00.
+Scale := 1.00
+
+; Enhance pointer precision: the OS acceleration curve.  It runs before
+; our scaling, so leaving it off is what makes the slider mean one thing.
 Accel := false
 
-; ---------- keyboard layer, derived from Speed ----------
-fastSpeed := 0      ; pixels per second at full tilt
-accelTime := 0      ; ms to ramp up to full speed
-minFactor := 0      ; starting fraction of fastSpeed
+; The pointer speed the user had before we took over, restored on exit.
+BaseSpeed := 10
+
+; ---------- the scaler ----------
+NEUTRAL_SPEED := 10     ; the only step that neither shrinks nor stretches
+hHook     := 0
+hCallback := 0
+sAccX     := 0.0        ; sub-pixel remainder carried between events
+sAccY     := 0.0
+
+; Windows pointer speed steps as multiples of step 10, measured on a real
+; machine and matching the documented table.  Used once, to carry an old
+; 1-to-20 setting over to the continuous slider.
+SPEED_TABLE := [0.03125, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0
+              , 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5]
+
+; ---------- keyboard layer ----------
+fastSpeed := 0      ; pixels per second at full tilt, derived from Scale
+accelTime := 300    ; ms to ramp up to full speed
+minFactor := 0.30   ; starting fraction of fastSpeed
 
 slowFactor := 0.30  ; fine mode (Z held) as a fraction of fastSpeed
 interval   := 4     ; ms per movement step
@@ -74,7 +89,73 @@ LoadConfig()
 BuildGui()
 BuildTray()
 
-TrayTip("Mouse Controll loaded", "Pointer speed " Speed " of 20`nCtrl+Shift+F12 = settings", 1)
+TrayTip("Mouse Controll loaded", "Sensitivity x" Format("{:.2f}", Scale) "`nCtrl+Shift+F12 = settings", 1)
+
+; ============================================================
+;  the scaler
+;
+;  Windows sits at its neutral step, so what arrives here is the
+;  raw count.  We swallow the real move, scale it, and place the
+;  cursor ourselves, keeping the fraction we could not spend.
+;  Our own SetCursorPos comes back flagged as injected, which is
+;  how this avoids chasing its own tail.
+; ============================================================
+
+MouseProc(nCode, wParam, lParam) {
+    global Scale, sAccX, sAccY
+    static pt := Buffer(8, 0)
+
+    if (nCode >= 0 && wParam = 0x0200) {                   ; WM_MOUSEMOVE
+        if !(NumGet(lParam, 12, "UInt") & 1) {             ; LLMHF_INJECTED
+            DllCall("GetCursorPos", "Ptr", pt)
+            cx := NumGet(pt, 0, "Int")
+            cy := NumGet(pt, 4, "Int")
+
+            sAccX += (NumGet(lParam, 0, "Int") - cx) * Scale
+            sAccY += (NumGet(lParam, 4, "Int") - cy) * Scale
+
+            mx := Round(sAccX)
+            my := Round(sAccY)
+            sAccX -= mx
+            sAccY -= my
+
+            if (mx != 0 || my != 0)
+                DllCall("SetCursorPos", "Int", cx + mx, "Int", cy + my)
+
+            return 1                                        ; swallow the original
+        }
+    }
+    return DllCall("CallNextHookEx", "Ptr", 0, "Int", nCode, "Ptr", wParam, "Ptr", lParam, "Ptr")
+}
+
+ScalerOn() {
+    global hHook, hCallback, sAccX, sAccY
+
+    if hHook
+        return
+    sAccX := 0.0
+    sAccY := 0.0
+    hCallback := CallbackCreate(MouseProc, "Fast", 3)
+    hHook := DllCall("SetWindowsHookEx"
+        , "Int", 14                                          ; WH_MOUSE_LL
+        , "Ptr", hCallback
+        , "Ptr", DllCall("GetModuleHandle", "Ptr", 0, "Ptr")
+        , "UInt", 0
+        , "Ptr")
+}
+
+ScalerOff() {
+    global hHook, hCallback
+
+    if hHook {
+        DllCall("UnhookWindowsHookEx", "Ptr", hHook)
+        hHook := 0
+    }
+    if hCallback {
+        CallbackFree(hCallback)
+        hCallback := 0
+    }
+}
 
 ; ============================================================
 ;  Windows pointer speed
@@ -108,23 +189,20 @@ SysSetAccel(on) {
 }
 
 ApplyToSystem() {
-    global Speed, Accel
+    global NEUTRAL_SPEED, Accel
 
-    SysSetSpeed(Speed)
+    SysSetSpeed(NEUTRAL_SPEED)
     SysSetAccel(Accel)
     ApplyKeyboardSpeed()
+    ScalerOn()
 }
 
 ; The keyboard layer tracks the same slider, so both pointers agree
-; about what "slow" means.
+; about what slow means.
 ApplyKeyboardSpeed() {
-    global Speed, fastSpeed, accelTime, minFactor
+    global Scale, fastSpeed
 
-    t := (Speed - 1) / 19.0              ; 0.0 .. 1.0
-
-    fastSpeed := 400 * (10 ** t)         ; 400 -> 4000 px/s, logarithmic
-    accelTime := 400 - 280 * t           ; 400 -> 120 ms
-    minFactor := 0.20 + 0.25 * t         ; 0.20 -> 0.45
+    fastSpeed := Clamp(2000 * Scale, 300, 4000)
 }
 
 ; ============================================================
@@ -132,36 +210,143 @@ ApplyKeyboardSpeed() {
 ; ============================================================
 
 LoadConfig() {
-    global CfgFile, Speed, Accel
+    global CfgFile, Scale, Accel, BaseSpeed, SPEED_TABLE
 
-    ; an empty read also covers a config from an older version of this script
-    raw := FileExist(CfgFile) ? IniRead(CfgFile, "Mouse", "Speed", "") : ""
+    raw := FileExist(CfgFile) ? IniRead(CfgFile, "Mouse", "Scale", "") : ""
+    old := FileExist(CfgFile) ? IniRead(CfgFile, "Mouse", "Speed", "") : ""
 
     if (raw != "") {
-        try Speed := Integer(raw)
+        try Scale := Number(raw)
         try Accel := Integer(IniRead(CfgFile, "Mouse", "Accel", "0")) != 0
-        Speed := Clamp(Speed, 1, 20)
-        ApplyToSystem()
+        try BaseSpeed := Integer(IniRead(CfgFile, "Mouse", "BaseSpeed", "10"))
+    } else if (old != "") {
+        ; carry a 1-to-20 setting from the previous version over unchanged
+        try BaseSpeed := Clamp(Integer(old), 1, 20)
+        try Accel := Integer(IniRead(CfgFile, "Mouse", "Accel", "0")) != 0
+        Scale := SPEED_TABLE[BaseSpeed]
     } else {
-        ; first run: adopt whatever Windows is already set to, change nothing
-        Speed := Clamp(SysGetSpeed(), 1, 20)
+        ; first run: match what Windows is set to now, so nothing changes feel
+        BaseSpeed := Clamp(SysGetSpeed(), 1, 20)
         Accel := SysGetAccel()
-        ApplyKeyboardSpeed()
-        SaveConfig()
+        Scale := SPEED_TABLE[BaseSpeed]
     }
+
+    Scale := Clamp(Round(Scale, 2), 0.05, 3.00)
+    BaseSpeed := Clamp(BaseSpeed, 1, 20)
+    ApplyToSystem()
+    SaveConfig()
 }
 
 SaveConfig() {
-    global CfgDir, CfgFile, Speed, Accel
+    global CfgDir, CfgFile, Scale, Accel, BaseSpeed
 
     if !DirExist(CfgDir)
         DirCreate(CfgDir)
-    IniWrite(Speed, CfgFile, "Mouse", "Speed")
+    IniWrite(Format("{:.2f}", Scale), CfgFile, "Mouse", "Scale")
     IniWrite(Accel ? 1 : 0, CfgFile, "Mouse", "Accel")
+    IniWrite(BaseSpeed, CfgFile, "Mouse", "BaseSpeed")
+    ; Speed belonged to the previous version and would be read back on load
+    try IniDelete(CfgFile, "Mouse", "Speed")
 }
 
 Clamp(v, lo, hi) {
     return v < lo ? lo : (v > hi ? hi : v)
+}
+
+; ============================================================
+;  profiles
+;
+;  Named settings kept in the same file, one section each, so a
+;  slow one for drawing and a fast one for everything else are a
+;  dropdown apart.  [Mouse] stays the live setting.
+;  PROFILE_PREFIX is set up at the top, with the config paths.
+; ============================================================
+
+ProfileNames() {
+    global CfgFile, PROFILE_PREFIX
+
+    names := []
+    if !FileExist(CfgFile)
+        return names
+
+    for _, sec in StrSplit(IniRead(CfgFile), "`n", "`r") {
+        if (SubStr(sec, 1, StrLen(PROFILE_PREFIX)) = PROFILE_PREFIX)
+            names.Push(SubStr(sec, StrLen(PROFILE_PREFIX) + 1))
+    }
+    return names
+}
+
+RefreshProfiles(select := "") {
+    global gProfiles
+
+    names := ProfileNames()
+    gProfiles.Delete()
+    if names.Length
+        gProfiles.Add(names)
+
+    if (select != "")
+        gProfiles.Text := select
+    else if names.Length
+        gProfiles.Value := 1
+}
+
+SaveProfile(*) {
+    global CfgDir, CfgFile, PROFILE_PREFIX, Scale, Accel, gProfiles
+
+    ib := InputBox("Name for the current setting", "Save profile", "w320 h130", gProfiles.Text)
+    if (ib.Result != "OK")
+        return
+
+    name := Trim(ib.Value)
+    if (name = "")
+        return
+    ; section names cannot carry these and still be readable back
+    name := RegExReplace(name, "[\[\]=`r`n]", "")
+    if (name = "")
+        return
+
+    if !DirExist(CfgDir)
+        DirCreate(CfgDir)
+    IniWrite(Format("{:.2f}", Scale), CfgFile, PROFILE_PREFIX name, "Scale")
+    IniWrite(Accel ? 1 : 0, CfgFile, PROFILE_PREFIX name, "Accel")
+    RefreshProfiles(name)
+    UpdateInfo()
+}
+
+LoadProfile(*) {
+    global CfgFile, PROFILE_PREFIX, Scale, Accel, gProfiles, gSlider, gAccel
+
+    name := gProfiles.Text
+    if (name = "")
+        return
+
+    raw := IniRead(CfgFile, PROFILE_PREFIX name, "Scale", "")
+    if (raw = "")
+        return
+
+    try Scale := Clamp(Round(Number(raw), 2), 0.05, 3.00)
+    try Accel := Integer(IniRead(CfgFile, PROFILE_PREFIX name, "Accel", "0")) != 0
+
+    SysSetAccel(Accel)
+    ApplyKeyboardSpeed()
+
+    gSlider.Value := Round(Scale * 100)
+    gAccel.Value := Accel ? 1 : 0
+    UpdateInfo()
+    SaveConfig()
+}
+
+DeleteProfile(*) {
+    global CfgFile, PROFILE_PREFIX, gProfiles
+
+    name := gProfiles.Text
+    if (name = "")
+        return
+    if (MsgBox("Delete the profile " name "?", "Mouse Controll", "YesNo Icon?") != "Yes")
+        return
+
+    try IniDelete(CfgFile, PROFILE_PREFIX name)
+    RefreshProfiles()
 }
 
 ; ============================================================
@@ -190,34 +375,45 @@ SetStartup(on) {
 ; ============================================================
 
 BuildGui() {
-    global g, gSlider, gInfo, gAccel, gStartup, Speed, Accel
+    global g, gSlider, gInfo, gAccel, gStartup, gProfiles, Scale, Accel
 
     g := Gui("+AlwaysOnTop -MinimizeBox", "Mouse Controll")
     g.MarginX := 16
     g.MarginY := 14
 
     g.SetFont("s11 w600", "Segoe UI")
-    g.Add("Text", "xm w360", "Pointer speed")
+    g.Add("Text", "xm w380", "Sensitivity")
 
     g.SetFont("s9 w400", "Segoe UI")
-    g.Add("Text", "xm w360 cGray", "Your mouse, every app. Takes effect as you drag.")
+    g.Add("Text", "xm w380 cGray", "Your mouse, every app. Arrow keys nudge by 0.01.")
 
-    gSlider := g.Add("Slider", "xm w360 Range1-20 TickInterval1 ToolTip", Speed)
+    gSlider := g.Add("Slider", "xm w380 Range5-300 Page10 TickInterval25 ToolTip", Round(Scale * 100))
     gSlider.OnEvent("Change", SliderChanged)
 
-    g.Add("Text", "xm w175 cGray", "slow, precise")
-    g.Add("Text", "x+10 w175 Right cGray", "fast")
+    g.Add("Text", "xm w185 cGray", "0.05  slow, precise")
+    g.Add("Text", "x+10 w185 Right cGray", "fast  3.00")
 
     g.SetFont("s9 w400", "Consolas")
-    gInfo := g.Add("Text", "xm w360 h34", "")
+    gInfo := g.Add("Text", "xm w380 h34", "")
 
     g.SetFont("s9 w400", "Segoe UI")
-    gAccel := g.Add("CheckBox", "xm w360", "Enhance pointer precision (acceleration)")
+    gAccel := g.Add("CheckBox", "xm w380", "Enhance pointer precision (acceleration)")
     gAccel.Value := Accel ? 1 : 0
     gAccel.OnEvent("Click", AccelToggled)
 
-    gStartup := g.Add("CheckBox", "xm w360", "Run when Windows starts")
+    gStartup := g.Add("CheckBox", "xm w380", "Run when Windows starts")
     gStartup.OnEvent("Click", StartupToggled)
+
+    g.SetFont("s11 w600", "Segoe UI")
+    g.Add("Text", "xm w380 Section", "Profiles")
+
+    g.SetFont("s9 w400", "Segoe UI")
+    ; an empty array is not a valid control list, so fill it after the fact
+    gProfiles := g.Add("DropDownList", "xm w164")
+    RefreshProfiles()
+    g.Add("Button", "x+8 w64", "Save").OnEvent("Click", SaveProfile)
+    g.Add("Button", "x+8 w64", "Load").OnEvent("Click", LoadProfile)
+    g.Add("Button", "x+8 w64", "Delete").OnEvent("Click", DeleteProfile)
 
     g.Add("Button", "xm w110 Default", "Close").OnEvent("Click", CloseSettings)
 
@@ -228,16 +424,13 @@ BuildGui() {
 }
 
 ShowSettings(*) {
-    global g, gSlider, gAccel, gStartup, Speed, Accel
+    global g, gSlider, gAccel, gStartup, Scale, Accel
 
-    ; something else may have moved these since we last looked
-    Speed := Clamp(SysGetSpeed(), 1, 20)
     Accel := SysGetAccel()
-    ApplyKeyboardSpeed()
-
-    gSlider.Value := Speed
+    gSlider.Value := Round(Scale * 100)
     gAccel.Value := Accel ? 1 : 0
     gStartup.Value := FileExist(StartupLink()) ? 1 : 0
+    RefreshProfiles()
     UpdateInfo()
     g.Show()
 }
@@ -250,10 +443,9 @@ CloseSettings(*) {
 }
 
 SliderChanged(ctrl, *) {
-    global Speed
+    global Scale
 
-    Speed := ctrl.Value
-    SysSetSpeed(Speed)
+    Scale := ctrl.Value / 100.0
     ApplyKeyboardSpeed()
     UpdateInfo()
 
@@ -265,11 +457,10 @@ SliderChanged(ctrl, *) {
 ; slider a notch ahead of what we actually applied.  Trust the control, not
 ; the event, once the dust settles.
 Settle() {
-    global Speed, gSlider
+    global Scale, gSlider
 
-    if (gSlider.Value != Speed) {
-        Speed := gSlider.Value
-        SysSetSpeed(Speed)
+    if (gSlider.Value != Round(Scale * 100)) {
+        Scale := gSlider.Value / 100.0
         ApplyKeyboardSpeed()
         UpdateInfo()
     }
@@ -282,7 +473,7 @@ AccelToggled(ctrl, *) {
     Accel := ctrl.Value != 0
     SysSetAccel(Accel)
     UpdateInfo()
-    SetTimer(SaveConfig, -600)
+    SetTimer(Settle, -400)
 }
 
 StartupToggled(ctrl, *) {
@@ -290,11 +481,11 @@ StartupToggled(ctrl, *) {
 }
 
 UpdateInfo() {
-    global gInfo, Speed, Accel, fastSpeed
+    global gInfo, Scale, fastSpeed, hHook
 
-    scale := Round(Speed / 10.0, 2)      ; 10 is the 1:1 setting
-    gInfo.Value := Format("speed {1:2} of 20   x{2} of default   accel {3}`nkeyboard arrows {4} px/s"
-        , Speed, scale, Accel ? "on " : "off", Round(fastSpeed))
+    step := Round(100 / (Scale * 100), 1)     ; one notch as a percentage of here
+    gInfo.Value := Format("x{1:.2f} of Windows default   one notch = {2}%`nscaler {3}   keyboard arrows {4} px/s"
+        , Scale, step, hHook ? "on " : "OFF", Round(fastSpeed))
 }
 
 ; ============================================================
@@ -312,6 +503,21 @@ BuildTray() {
 }
 
 ^+F12::ShowSettings()
+
+; Panic switch: drop the scaler and hand the mouse back to Windows
+^+F11:: {
+    global hHook, BaseSpeed, Scale
+
+    if hHook {
+        ScalerOff()
+        SysSetSpeed(BaseSpeed)
+        TrayTip("Scaler off", "Windows pointer speed back to " BaseSpeed, 1)
+    } else {
+        ApplyToSystem()
+        TrayTip("Scaler on", "Sensitivity x" Format("{:.2f}", Scale), 1)
+    }
+    UpdateInfo()
+}
 
 ; ============================================================
 ;  high resolution clock
@@ -534,7 +740,14 @@ Scroll(key, wheel) {
     KeyWait("RShift")
 }
 
+; Hand the mouse back exactly as we found it.  Also fires on logoff and
+; shutdown; a hard kill is the one case that leaves Windows on the
+; neutral step, which the next launch puts right.
 CleanUp(*) {
+    global BaseSpeed
+
+    ScalerOff()
+    SysSetSpeed(BaseSpeed)
     Click("Left Up")
     DllCall("winmm\timeEndPeriod", "UInt", 1)
 }
