@@ -23,6 +23,11 @@ precise it feels. AutoHotkey v2, Windows only.
 
 The tray icon opens the same settings window.
 
+Only one instance runs at a time. Launching it again while it is already
+running does nothing: the second copy exits immediately and the first keeps
+going, hotkeys and all. Use **Reload** in the tray menu to pick up edits to
+the script.
+
 ## The slider
 
 One value, `1` to `100`, drives three things at once:

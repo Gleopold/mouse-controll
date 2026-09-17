@@ -1,5 +1,6 @@
 #Requires AutoHotkey v2.0
-#SingleInstance Force
+; Ignore, not Force: a second launch exits and leaves the running one alone
+#SingleInstance Ignore
 #MaxThreadsPerHotkey 1
 
 ; ============================================================
