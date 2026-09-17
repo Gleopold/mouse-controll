@@ -4,8 +4,14 @@
 #MaxThreadsPerHotkey 1
 
 ; ============================================================
-;  Mouse Controll - keyboard driven pointer with one precision
-;  slider.  Settings live in %APPDATA%\mouse-controll\config.ini
+;  Mouse Controll
+;
+;  One slider sets the Windows pointer speed for the physical
+;  mouse, system wide.  The setting is saved to
+;  %APPDATA%\mouse-controll\config.ini and reapplied at launch,
+;  so putting this in Startup restores it at every login.
+;
+;  The keyboard pointer layer rides on the same slider:
 ;
 ;  Ctrl+Shift + arrows      move the pointer
 ;  Ctrl+Shift + X + arrows  scroll the wheel
@@ -21,21 +27,33 @@ SetMouseDelay(-1)
 CoordMode("Mouse", "Screen")
 DllCall("winmm\timeBeginPeriod", "UInt", 1)
 
+; ---------- SystemParametersInfo ----------
+SPI_GETMOUSE      := 0x0003
+SPI_SETMOUSE      := 0x0004
+SPI_GETMOUSESPEED := 0x0070
+SPI_SETMOUSESPEED := 0x0071
+SPIF_UPDATEINIFILE := 0x01
+SPIF_SENDCHANGE    := 0x02
+
 ; ---------- config location ----------
 CfgDir  := A_AppData "\mouse-controll"
 CfgFile := CfgDir "\config.ini"
 
 ; ---------- the one tunable ----------
-; 1   = fastest, coarsest
-; 100 = slowest, finest
-Precision := 50
+; Windows pointer speed, 1 (slowest, most precise) to 20 (fastest).
+; 10 is the Windows default and the only value that applies no scaling
+; to what the mouse actually reports.
+Speed := 10
 
-; ---------- derived from Precision by ApplyPrecision() ----------
+; Enhance pointer precision: the OS acceleration curve.  Off means the
+; pointer moves the same distance for the same hand movement every time.
+Accel := false
+
+; ---------- keyboard layer, derived from Speed ----------
 fastSpeed := 0      ; pixels per second at full tilt
 accelTime := 0      ; ms to ramp up to full speed
 minFactor := 0      ; starting fraction of fastSpeed
 
-; ---------- fixed feel ----------
 slowFactor := 0.30  ; fine mode (Z held) as a fraction of fastSpeed
 interval   := 4     ; ms per movement step
 
@@ -56,41 +74,90 @@ LoadConfig()
 BuildGui()
 BuildTray()
 
-TrayTip("Mouse Controll loaded", "Ctrl+Shift+arrows = move`nCtrl+Shift+F12 = settings", 1)
+TrayTip("Mouse Controll loaded", "Pointer speed " Speed " of 20`nCtrl+Shift+F12 = settings", 1)
+
+; ============================================================
+;  Windows pointer speed
+; ============================================================
+
+SysGetSpeed() {
+    DllCall("SystemParametersInfo", "UInt", 0x0070, "UInt", 0, "UInt*", &spd := 0, "UInt", 0)
+    return spd
+}
+
+SysSetSpeed(v) {
+    ; pvParam carries the value itself here, not a pointer to it
+    DllCall("SystemParametersInfo", "UInt", 0x0071, "UInt", 0, "Ptr", v, "UInt", 0x01 | 0x02)
+}
+
+; SPI_GETMOUSE fills three ints: threshold1, threshold2, acceleration
+SysGetAccel() {
+    buf := Buffer(12, 0)
+    DllCall("SystemParametersInfo", "UInt", 0x0003, "UInt", 0, "Ptr", buf, "UInt", 0)
+    return NumGet(buf, 8, "Int") != 0
+}
+
+SysSetAccel(on) {
+    buf := Buffer(12, 0)
+    if on {
+        NumPut("Int", 6, buf, 0)      ; Windows defaults
+        NumPut("Int", 10, buf, 4)
+        NumPut("Int", 1, buf, 8)
+    }                                  ; else leave all three at zero
+    DllCall("SystemParametersInfo", "UInt", 0x0004, "UInt", 0, "Ptr", buf, "UInt", 0x01 | 0x02)
+}
+
+ApplyToSystem() {
+    global Speed, Accel
+
+    SysSetSpeed(Speed)
+    SysSetAccel(Accel)
+    ApplyKeyboardSpeed()
+}
+
+; The keyboard layer tracks the same slider, so both pointers agree
+; about what "slow" means.
+ApplyKeyboardSpeed() {
+    global Speed, fastSpeed, accelTime, minFactor
+
+    t := (Speed - 1) / 19.0              ; 0.0 .. 1.0
+
+    fastSpeed := 400 * (10 ** t)         ; 400 -> 4000 px/s, logarithmic
+    accelTime := 400 - 280 * t           ; 400 -> 120 ms
+    minFactor := 0.20 + 0.25 * t         ; 0.20 -> 0.45
+}
 
 ; ============================================================
 ;  config
 ; ============================================================
 
 LoadConfig() {
-    global CfgFile, Precision
+    global CfgFile, Speed, Accel
 
-    if FileExist(CfgFile) {
-        try Precision := Integer(IniRead(CfgFile, "MouseKeys", "Precision", "50"))
+    ; an empty read also covers a config from an older version of this script
+    raw := FileExist(CfgFile) ? IniRead(CfgFile, "Mouse", "Speed", "") : ""
+
+    if (raw != "") {
+        try Speed := Integer(raw)
+        try Accel := Integer(IniRead(CfgFile, "Mouse", "Accel", "0")) != 0
+        Speed := Clamp(Speed, 1, 20)
+        ApplyToSystem()
+    } else {
+        ; first run: adopt whatever Windows is already set to, change nothing
+        Speed := Clamp(SysGetSpeed(), 1, 20)
+        Accel := SysGetAccel()
+        ApplyKeyboardSpeed()
+        SaveConfig()
     }
-    Precision := Clamp(Precision, 1, 100)
-    ApplyPrecision()
 }
 
 SaveConfig() {
-    global CfgDir, CfgFile, Precision
+    global CfgDir, CfgFile, Speed, Accel
 
     if !DirExist(CfgDir)
         DirCreate(CfgDir)
-    IniWrite(Precision, CfgFile, "MouseKeys", "Precision")
-}
-
-; One slider, three knobs.  Higher precision means a lower top speed,
-; a gentler ramp and a smaller first step, so a short tap nudges the
-; pointer a few pixels instead of throwing it across the screen.
-ApplyPrecision() {
-    global Precision, fastSpeed, accelTime, minFactor
-
-    t := (Precision - 1) / 99.0          ; 0.0 .. 1.0
-
-    fastSpeed := 4000 * (0.1 ** t)       ; 4000 -> 400 px/s, logarithmic
-    accelTime := 120 + 280 * t           ;  120 -> 400 ms
-    minFactor := 0.45 - 0.25 * t         ; 0.45 -> 0.20
+    IniWrite(Speed, CfgFile, "Mouse", "Speed")
+    IniWrite(Accel ? 1 : 0, CfgFile, "Mouse", "Accel")
 }
 
 Clamp(v, lo, hi) {
@@ -123,28 +190,32 @@ SetStartup(on) {
 ; ============================================================
 
 BuildGui() {
-    global g, gSlider, gInfo, gStartup, Precision
+    global g, gSlider, gInfo, gAccel, gStartup, Speed, Accel
 
     g := Gui("+AlwaysOnTop -MinimizeBox", "Mouse Controll")
     g.MarginX := 16
     g.MarginY := 14
 
     g.SetFont("s11 w600", "Segoe UI")
-    g.Add("Text", "xm w360", "Precision")
+    g.Add("Text", "xm w360", "Pointer speed")
 
     g.SetFont("s9 w400", "Segoe UI")
-    g.Add("Text", "xm w360 cGray", "Drag left for speed, right for control.")
+    g.Add("Text", "xm w360 cGray", "Your mouse, every app. Takes effect as you drag.")
 
-    gSlider := g.Add("Slider", "xm w360 Range1-100 TickInterval10 ToolTip", Precision)
+    gSlider := g.Add("Slider", "xm w360 Range1-20 TickInterval1 ToolTip", Speed)
     gSlider.OnEvent("Change", SliderChanged)
 
-    g.Add("Text", "xm w175 cGray", "fast")
-    g.Add("Text", "x+10 w175 Right cGray", "fine")
+    g.Add("Text", "xm w175 cGray", "slow, precise")
+    g.Add("Text", "x+10 w175 Right cGray", "fast")
 
     g.SetFont("s9 w400", "Consolas")
     gInfo := g.Add("Text", "xm w360 h34", "")
 
     g.SetFont("s9 w400", "Segoe UI")
+    gAccel := g.Add("CheckBox", "xm w360", "Enhance pointer precision (acceleration)")
+    gAccel.Value := Accel ? 1 : 0
+    gAccel.OnEvent("Click", AccelToggled)
+
     gStartup := g.Add("CheckBox", "xm w360", "Run when Windows starts")
     gStartup.OnEvent("Click", StartupToggled)
 
@@ -157,9 +228,15 @@ BuildGui() {
 }
 
 ShowSettings(*) {
-    global g, gSlider, gStartup, Precision
+    global g, gSlider, gAccel, gStartup, Speed, Accel
 
-    gSlider.Value := Precision
+    ; something else may have moved these since we last looked
+    Speed := Clamp(SysGetSpeed(), 1, 20)
+    Accel := SysGetAccel()
+    ApplyKeyboardSpeed()
+
+    gSlider.Value := Speed
+    gAccel.Value := Accel ? 1 : 0
     gStartup.Value := FileExist(StartupLink()) ? 1 : 0
     UpdateInfo()
     g.Show()
@@ -168,33 +245,56 @@ ShowSettings(*) {
 CloseSettings(*) {
     global g
 
-    SaveConfig()
+    Settle()
     g.Hide()
 }
 
 SliderChanged(ctrl, *) {
-    global Precision
+    global Speed
 
-    Precision := ctrl.Value
-    ApplyPrecision()
+    Speed := ctrl.Value
+    SysSetSpeed(Speed)
+    ApplyKeyboardSpeed()
     UpdateInfo()
 
     ; the slider fires on every pixel of the drag, so settle before writing
-    SetTimer(SaveConfig, -600)
+    SetTimer(Settle, -400)
 }
 
-UpdateInfo() {
-    global gInfo, Precision, fastSpeed, slowFactor, minFactor
+; A fast drag can outrun the Change event and drop the last one, leaving the
+; slider a notch ahead of what we actually applied.  Trust the control, not
+; the event, once the dust settles.
+Settle() {
+    global Speed, gSlider
 
-    ; how far a short tap of roughly 60 ms carries the pointer
-    tap := Round(fastSpeed * minFactor * 0.06)
+    if (gSlider.Value != Speed) {
+        Speed := gSlider.Value
+        SysSetSpeed(Speed)
+        ApplyKeyboardSpeed()
+        UpdateInfo()
+    }
+    SaveConfig()
+}
 
-    gInfo.Value := Format("level {1:3}   top {2:4} px/s   fine {3:4} px/s`ntap moves about {4} px"
-        , Precision, Round(fastSpeed), Round(fastSpeed * slowFactor), tap)
+AccelToggled(ctrl, *) {
+    global Accel
+
+    Accel := ctrl.Value != 0
+    SysSetAccel(Accel)
+    UpdateInfo()
+    SetTimer(SaveConfig, -600)
 }
 
 StartupToggled(ctrl, *) {
     SetStartup(ctrl.Value)
+}
+
+UpdateInfo() {
+    global gInfo, Speed, Accel, fastSpeed
+
+    scale := Round(Speed / 10.0, 2)      ; 10 is the 1:1 setting
+    gInfo.Value := Format("speed {1:2} of 20   x{2} of default   accel {3}`nkeyboard arrows {4} px/s"
+        , Speed, scale, Accel ? "on " : "off", Round(fastSpeed))
 }
 
 ; ============================================================
